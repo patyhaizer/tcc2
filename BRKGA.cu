@@ -113,10 +113,10 @@ void setupRand(curandState * state, unsigned long seed) {
     curand_init(seed, tid, 0, &state[tid]);
 }
 
-__global__ void genInitialPop(curandState * globalState, Population *pop) {
+__global__ void genInitialPop(curandState * globalState, Population *pop, int size) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
 
-    int individualId = blockIdx.x;
+    int individualId = blockIdx.x + (size * NUM_BLOCKS);
     int aleloId = threadIdx.x;
     curandState localState = globalState[tid];
     double random = curand_uniform_double(&localState);
@@ -127,50 +127,60 @@ __global__ void genInitialPop(curandState * globalState, Population *pop) {
     globalState[tid] = localState;
 }
 
-__global__ void evaluate(Population *pop, Instance * inst) {
-    int individualId = blockIdx.x;
+__global__ void evaluate(Population *pop, Instance * inst, int size) {
+    int individualId = blockIdx.x + (size * NUM_BLOCKS);
     int aleloId = threadIdx.x;
-    //int instanceId = blockIdx.y;
+    int tid = threadIdx.x;
     char decodedAlele;
-    __shared__ int chromossomeCost[INSTANCE_SIZE][CHROMOSSOME_SIZE];
-    int individualFitness;
+    __shared__ int chromossomeCost[NUM_THREADS];
+    if (tid < NUM_THREADS) {
+        chromossomeCost[tid] = 0;
+    }
+    __syncthreads();
 
     if (aleloId < CHROMOSSOME_SIZE) {
-        // DO I NEED INITIALIZATION HERE?????
-        //chromossomeCost[aleloId] = 0;
-        //__syncthreads();
         decodedAlele = decodeAlele(pop->m_chromossomes[individualId].m_chromossome[aleloId]);
-        for (int i = 0; i < INSTANCE_SIZE; ++i) {
-            chromossomeCost[i][aleloId] = (decodedAlele != inst->m_instanceData[i][aleloId]);
-        }
-        __syncthreads();
-        if (threadIdx.x < 9) {
-            individualFitness = 0;
-            // Sum all elements to calculate the cost
-            for (int i = 0; i < CHROMOSSOME_SIZE; ++i) {
-                individualFitness += chromossomeCost[threadIdx.x][i];
+        for (int instanceId = 0; instanceId < INSTANCE_SIZE; ++instanceId) {
+            chromossomeCost[aleloId] = (decodedAlele != inst->m_instanceData[instanceId][aleloId]);
+            __syncthreads();
+            for (unsigned int s=blockDim.x/2; s>0; s>>=1) {
+                if (tid < s) {
+                    //printf("cost[%i]: %i - cost[%i+%i]: %i \n", tid, chromossomeCost[tid], tid, s, chromossomeCost[tid+s]);
+                    chromossomeCost[tid] += chromossomeCost[tid + s];
+                }
+                __syncthreads();
             }
-            // Access global memory to do an atomic operation to uptade chromossome cost
-            atomicMax(&(pop->m_chromossomes[individualId].m_fitness), individualFitness);
+            // if (threadIdx.x == 0) {
+            //     int individualFitness = 0;
+            //     // Sum all elements to calculate the cost
+            //     for (int i = 0; i < blockDim.x; ++i) {
+            //         individualFitness += chromossomeCost[i];
+            //     }
+            if (tid == 0) {
+                // Access global memory to do an atomic operation to uptade chromossome cost
+                atomicMax(&(pop->m_chromossomes[individualId].m_fitness), chromossomeCost[0]);
+            }
+            __syncthreads();
+            // }
         }
     }
 }
 
-__global__ void generateNextPop(curandState * globalState, Population *prevPop, Population *nextPop) {
+__global__ void generateNextPop(curandState * globalState, Population *prevPop, Population *nextPop, int size) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     curandState state = globalState[tid];
 
     __shared__ int eliteId;
     __shared__ int nonEliteId;
 
-    int individualId = blockIdx.x;
+    int individualId = blockIdx.x + (size * NUM_BLOCKS);
     int aleloId = threadIdx.x;
 
-    if (blockIdx.x < ELITE_SIZE) {
+    if (individualId < ELITE_SIZE) {
         // then make the copy of the chromossome since it is an elite
         nextPop->m_chromossomes[individualId].m_chromossome[aleloId] = prevPop->m_chromossomes[individualId].m_chromossome[aleloId];
         nextPop->m_chromossomes[individualId].m_fitness = 0;
-    } else if (blockIdx.x < ELITE_SIZE + MUTANT_SIZE) {
+    } else if (individualId < ELITE_SIZE + MUTANT_SIZE) {
         // generate mutant individuals
         double random = curand_uniform_double(&state);
         nextPop->m_chromossomes[individualId].m_chromossome[aleloId] = random;
@@ -201,7 +211,7 @@ __global__ void generateNextPop(curandState * globalState, Population *prevPop, 
 
 void loadFromFile(std::vector<string>& instanceData) {
     //COLOQUE AQUI O ARQUIVO QUE CONTÉM A INSTÂNCIA QUE PRETENDE EXECUTAR
-    string instance_dir = "/home/lapo/mfonseca/Documents/Patricia/Instance/20caracteres/";
+    string instance_dir = "/home/paty.haizer/Code/Instance/20caracteres/";
 
     //ARQUIVOS DE INSTÂNCIAS A SEREM UTILIZADOS
     std::vector<string> instance_name;
@@ -307,11 +317,16 @@ int main(int argc, char **argv) {
     cudaEventSynchronize(randomTime);
     cudaEventElapsedTime(&elapsedTime, start, randomTime);
     std::cout << "Time to generate random value: " << (elapsedTime/1000) << std::endl;
-    genInitialPop <<<NUM_BLOCKS, NUM_THREADS>>> (devStates, d_pop);
+    for (int x = 0; x < BRKGA_pop_size / NUM_BLOCKS; ++x) {
+        genInitialPop <<<NUM_BLOCKS, NUM_THREADS>>> (devStates, d_pop, x);
+    }
     //time_t TStop = time(NULL), TStart = time(NULL);
     int i = 0;
     while (true) {
-        evaluate <<<NUM_BLOCKS, NUM_THREADS>>>(d_pop, d_instance);
+        for (int x = 0; x < BRKGA_pop_size / NUM_BLOCKS; ++x) {
+            evaluate <<<NUM_BLOCKS, NUM_THREADS>>>(d_pop, d_instance, x);
+        }
+        //cudaDeviceSynchronize();
         // Sort chromossomes by fitness
         thrust::device_ptr<Individual> t_chromossomes(d_pop->m_chromossomes);
         thrust::sort(t_chromossomes, t_chromossomes + BRKGA_pop_size);
@@ -325,7 +340,9 @@ int main(int argc, char **argv) {
         // First copy the current pop to previous:
         CUDA_CALL(cudaMemcpy(d_popPrevious, d_pop, sizeof(Population), cudaMemcpyDeviceToDevice));
         // call kernel to generate new population
-        generateNextPop <<<NUM_BLOCKS, NUM_THREADS>>>(devStates, d_popPrevious, d_pop);
+        for (int x = 0; x < BRKGA_pop_size / NUM_BLOCKS; ++x) {
+            generateNextPop <<<NUM_BLOCKS, NUM_THREADS>>>(devStates, d_popPrevious, d_pop, x);
+        }
         //TStop = time(NULL);
         ++i;
     }
